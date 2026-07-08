@@ -17,7 +17,7 @@ class StructuredLogger:
     _instance: Optional['StructuredLogger'] = None
     _initialized = False
     
-    def __new__(cls) -> 'StructuredLogger':
+    def __new__(cls, *args, **kwargs) -> 'StructuredLogger':
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
