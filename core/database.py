@@ -1,48 +1,113 @@
+"""
+database.py — Gestor de base de datos SQLite con caching y optimizaciones.
+
+Administra el catálogo de productos de Veltri Tecnologic (100+ SKUs)
+con soporte para búsquedas, caching en memoria y gestión de conexiones.
+"""
+
 import sqlite3
 import random
+from typing import Optional, List, Dict, Any
+from functools import lru_cache
+
+try:
+    from core.logger import get_logger
+    logger = get_logger(__name__)
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
     """
     Gestiona la base de datos local SQLite del catálogo de productos Veltri Tecnologic.
-    Catálogo ampliado: 100+ productos incluyendo laptops, periféricos, monitores y componentes.
+    
+    Características:
+    - Catálogo de 100+ productos (laptops, componentes, periféricos, monitores)
+    - Búsqueda por nombre, categoría y descripción
+    - Caching de categorías para optimización
+    - Type hints completos
+    - Logging estructurado de operaciones
     """
 
-    def __init__(self, db_path: str = "veltri_shop.db"):
+    def __init__(self, db_path: str = "veltri_shop.db") -> None:
+        """Inicializa el gestor de base de datos.
+        
+        Args:
+            db_path: Ruta al archivo SQLite. Por defecto 'veltri_shop.db'.
+        """
         self.db_path = db_path
+        self._category_cache: Optional[List[str]] = None
         self._init_db()
+        logger.info(f"DatabaseManager inicializado con BD en: {db_path}")
 
-    def _get_conn(self):
-        return sqlite3.connect(self.db_path)
+    def _get_conn(self) -> sqlite3.Connection:
+        """Obtiene una conexión a la base de datos.
+        
+        Returns:
+            Conexión a SQLite.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row  # Acceso a columnas por nombre
+        return conn
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         """Crea las tablas e inserta datos semilla si la BD está vacía."""
-        with self._get_conn() as conn:
-            c = conn.cursor()
+        try:
+            with self._get_conn() as conn:
+                c = conn.cursor()
 
-            # Migración automática si existe esquema antiguo
-            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='productos'")
-            if c.fetchone():
-                c.execute("PRAGMA table_info(productos)")
-                cols = [row[1] for row in c.fetchall()]
-                if "precio_base" not in cols or "descripcion" not in cols:
-                    c.execute("DROP TABLE productos")
-                    conn.commit()
+                # Migración automática si existe esquema antiguo
+                c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='productos'")
+                if c.fetchone():
+                    c.execute("PRAGMA table_info(productos)")
+                    cols = [row[1] for row in c.fetchall()]
+                    if "precio_base" not in cols or "descripcion" not in cols:
+                        logger.warning("Schema desactualizado detectado. Regenerando tabla productos...")
+                        c.execute("DROP TABLE productos")
+                        conn.commit()
 
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS productos (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nombre          TEXT    NOT NULL UNIQUE,
-                    categoria       TEXT    NOT NULL,
-                    marca           TEXT    NOT NULL,
-                    precio_base     REAL    NOT NULL,
-                    stock_base      INTEGER NOT NULL,
-                    garantia_meses  INTEGER NOT NULL,
-                    descripcion     TEXT    DEFAULT ''
-                )
-            """)
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS productos (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        nombre          TEXT    NOT NULL UNIQUE,
+                        categoria       TEXT    NOT NULL,
+                        marca           TEXT    NOT NULL,
+                        precio_base     REAL    NOT NULL,
+                        stock_base      INTEGER NOT NULL,
+                        garantia_meses  INTEGER NOT NULL,
+                        descripcion     TEXT    DEFAULT ''
+                    )
+                """)
 
-            c.execute("SELECT COUNT(*) FROM productos")
+                c.execute("SELECT COUNT(*) FROM productos")
+                count = c.fetchone()[0]
+                if count == 0:
+                    logger.info("Insertando datos semilla (100+ productos)...")
+                    self._insertar_datos_semilla(c, conn)
+                else:
+                    logger.info(f"Base de datos contiene {count} productos.")
+                    
+        except Exception as e:
+            logger.error(f"Error en inicialización de BD: {e}")
+            raise
+    
+    def _insertar_datos_semilla(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection) -> None:
+        """Inserta los datos iniciales de productos en la base de datos.
+        
+        Args:
+            cursor: Cursor de la conexión SQLite.
+            conn: Conexión a la base de datos.
+        """
+        c = cursor
+        c.execute("SELECT COUNT(*) FROM productos")
+        if c.fetchone()[0] == 0:
+            semilla = []
+            c.executemany("""
+                INSERT INTO productos (nombre, categoria, marca, precio_base, stock_base, garantia_meses, descripcion)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, semilla)
+            conn.commit()
             if c.fetchone()[0] == 0:
                 semilla = [
                     # ── LAPTOPS (20 unidades) ─────────────────────────────────────────────
@@ -177,67 +242,113 @@ class DatabaseManager:
     # Búsqueda con variabilidad dinámica
     # ------------------------------------------------------------------
 
-    def buscar_producto(self, query: str, verbose: bool = False) -> list[dict]:
-        """
-        Busca productos por nombre, categoría o descripción.
+    def buscar_producto(self, query: str, verbose: bool = False) -> List[Dict[str, Any]]:
+        """Busca productos por nombre, categoría o descripción.
+        
         Introduce variabilidad realista: fluctuación de stock, descuentos flash.
+        
+        Args:
+            query: Término de búsqueda.
+            verbose: Si True, registra logs de búsqueda.
+        
+        Returns:
+            Lista de dictionnarios con información de productos.
         """
-        with self._get_conn() as conn:
-            c = conn.cursor()
-            q = f"%{query.lower()}%"
-            c.execute(
-                """SELECT nombre, categoria, marca, precio_base, stock_base, garantia_meses, descripcion
-                   FROM productos
-                   WHERE LOWER(nombre) LIKE ? OR LOWER(categoria) LIKE ? OR LOWER(descripcion) LIKE ?""",
-                (q, q, q)
-            )
-            filas = c.fetchall()
+        try:
+            with self._get_conn() as conn:
+                c = conn.cursor()
+                q = f"%{query.lower()}%"
+                c.execute(
+                    """SELECT nombre, categoria, marca, precio_base, stock_base, garantia_meses, descripcion
+                       FROM productos
+                       WHERE LOWER(nombre) LIKE ? OR LOWER(categoria) LIKE ? OR LOWER(descripcion) LIKE ?
+                       LIMIT 20""",
+                    (q, q, q)
+                )
+                filas = c.fetchall()
 
-        resultado = []
-        for nombre, categoria, marca, precio_base, stock_base, garantia, desc in filas:
-            stock_actual = max(0, stock_base + random.randint(-3, 3))
-            descuento    = random.choice([0.0, 0.05, 0.10])
-            precio_hoy   = round(precio_base * (1 - descuento), 2)
+            resultado = []
+            for nombre, categoria, marca, precio_base, stock_base, garantia, desc in filas:
+                stock_actual = max(0, stock_base + random.randint(-3, 3))
+                descuento    = random.choice([0.0, 0.05, 0.10])
+                precio_hoy   = round(precio_base * (1 - descuento), 2)
 
-            if verbose:
-                print(f"  [SQL] '{nombre}': stock={stock_actual} | precio=S/.{precio_hoy} ({int(descuento*100)}%dto)")
+                if verbose:
+                    logger.debug(f"SQL: {nombre} | Stock: {stock_actual} | Precio: S/.{precio_hoy}")
 
-            resultado.append({
-                "nombre":         nombre,
-                "categoria":      categoria,
-                "marca":          marca,
-                "precio":         precio_hoy,
-                "precio_base":    precio_base,
-                "stock":          stock_actual,
-                "garantia_meses": garantia,
-                "descripcion":    desc,
-                "en_stock":       stock_actual > 0,
-                "tiene_descuento": descuento > 0,
-            })
+                resultado.append({
+                    "nombre":          nombre,
+                    "categoria":       categoria,
+                    "marca":           marca,
+                    "precio":          precio_hoy,
+                    "precio_base":     precio_base,
+                    "stock":           stock_actual,
+                    "garantia_meses":  garantia,
+                    "descripcion":     desc,
+                    "en_stock":        stock_actual > 0,
+                    "tiene_descuento": descuento > 0,
+                })
 
-        return resultado
+            logger.info(f"Búsqueda '{query}': {len(resultado)} productos encontrados")
+            return resultado
+            
+        except Exception as e:
+            logger.error(f"Error en búsqueda de producto '{query}': {e}")
+            return []
 
     def obtener_catalogo_texto(self, query: str, verbose: bool = False) -> str:
-        """Devuelve el catálogo formateado como texto para inyectarlo en el prompt."""
-        productos = self.buscar_producto(query, verbose=verbose)
-        if not productos:
-            return f"No se encontraron productos relacionados con '{query}' en el inventario actual."
+        """Devuelve el catálogo formateado como texto para inyectarlo en el prompt.
+        
+        Args:
+            query: Término de búsqueda.
+            verbose: Si True, registra logs adicionales.
+        
+        Returns:
+            String con catálogo formateado o mensaje de error.
+        """
+        try:
+            productos = self.buscar_producto(query, verbose=verbose)
+            if not productos:
+                msg = f"No se encontraron productos relacionados con '{query}' en el inventario actual."
+                logger.warning(msg)
+                return msg
 
-        lineas = ["CATÁLOGO EN TIEMPO REAL — VELTRI TECNOLOGIC:"]
-        for p in productos:
-            estado = "✅ En stock" if p["en_stock"] else "❌ Sin stock"
-            oferta = f" 🔥 ¡Oferta hoy! (precio normal S/.{p['precio_base']})" if p["tiene_descuento"] else ""
-            lineas.append(
-                f"  • {p['nombre']} | {p['marca']} | S/.{p['precio']}{oferta} | "
-                f"{p['stock']} uds | Garantía: {p['garantia_meses']} meses | {estado}"
-            )
-            if p["descripcion"]:
-                lineas.append(f"    └ {p['descripcion']}")
-        return "\n".join(lineas)
+            lineas = ["CATÁLOGO EN TIEMPO REAL — VELTRI TECNOLOGIC:"]
+            for p in productos:
+                estado = "✅ En stock" if p["en_stock"] else "❌ Sin stock"
+                oferta = f" 🔥 Oferta! (normal S/.{p['precio_base']})" if p["tiene_descuento"] else ""
+                lineas.append(
+                    f"  • {p['nombre']} | {p['marca']} | S/.{p['precio']}{oferta} | "
+                    f"{p['stock']} uds | Garantía: {p['garantia_meses']} meses | {estado}"
+                )
+                if p["descripcion"]:
+                    lineas.append(f"    └ {p['descripcion']}")
+            
+            catalogo = "\n".join(lineas)
+            logger.info(f"Catálogo generado con {len(productos)} productos")
+            return catalogo
+            
+        except Exception as e:
+            logger.error(f"Error generando catálogo: {e}")
+            return f"Error al generar catálogo: {str(e)}"
 
-    def listar_categorias(self) -> list[str]:
-        """Retorna las categorías disponibles."""
-        with self._get_conn() as conn:
-            c = conn.cursor()
-            c.execute("SELECT DISTINCT categoria FROM productos ORDER BY categoria")
-            return [row[0] for row in c.fetchall()]
+    def listar_categorias(self) -> List[str]:
+        """Retorna las categorías disponibles (con caching).
+        
+        Returns:
+            Lista de categorías únicas ordenadas alfabéticamente.
+        """
+        if self._category_cache is not None:
+            return self._category_cache
+            
+        try:
+            with self._get_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT DISTINCT categoria FROM productos ORDER BY categoria")
+                categorias = [row[0] for row in c.fetchall()]
+                self._category_cache = categorias
+                logger.info(f"Categorías cargadas: {len(categorias)} encontradas")
+                return categorias
+        except Exception as e:
+            logger.error(f"Error listando categorías: {e}")
+            return []
