@@ -134,6 +134,7 @@ def run_swarm_gemini(
         except Exception as e:
             t1 = time.time()
             error_str = str(e)
+            error_type = type(e).__name__
             ultima_excepcion = e
 
             if event_bus:
@@ -143,28 +144,67 @@ def run_swarm_gemini(
                     "intento": intento
                 })
 
-            # Detectar error 429 (cuota agotada)
-            if "429" in error_str and intento < MAX_REINTENTOS:
-                espera = ESPERA_REINTENTO * intento
-                logger.warning(f"Error 429 detectado. Esperando {espera}s antes de reintentar...")
-                if verbose:
-                    print(f"  [REINTENTO] Error 429 (cuota). Esperando {espera}s...")
-                time.sleep(espera)
-            else:
-                logger.error(
-                    f"Error en llamada Gemini (intento {intento}): "
-                    f"{type(e).__name__}: {error_str[:120]}"
+            logger.error(
+                f"Error en llamada Gemini (intento {intento}/{MAX_REINTENTOS}): "
+                f"{error_type}: {error_str[:200]}"
+            )
+
+            # ── Clasificar el tipo de error para mensajes claros ────────────
+            error_lower = error_str.lower()
+
+            # Error de API key inválida o faltante
+            if any(k in error_lower for k in ["api_key", "api key", "401", "permission", "unauthenticated"]):
+                error_msg = (
+                    "API Key de Gemini inválida o no configurada. "
+                    "Verifica tu clave en la configuración del sistema."
                 )
+                logger.critical(f"Error de autenticación: {error_msg}")
+                return agent, f"[SISTEMA: {error_msg}]"
+
+            # Error de cuota agotada (429)
+            if "429" in error_str or "quota" in error_lower or "resource_exhausted" in error_lower:
                 if intento < MAX_REINTENTOS:
+                    espera = min(ESPERA_REINTENTO * intento, 60)  # máx 60s para no colgar Render
+                    logger.warning(f"Cuota agotada (429). Esperando {espera}s antes de reintentar...")
+                    if verbose:
+                        print(f"  [REINTENTO] Cuota agotada. Esperando {espera}s...")
+                    time.sleep(espera)
                     continue
                 else:
-                    # Último intento falló
                     error_msg = (
-                        f"Error tras {MAX_REINTENTOS} intentos - {type(e).__name__}. "
-                        f"Contacta a soporte o reintenta en unos minutos."
+                        "Cuota de la API de Gemini agotada. "
+                        "Espera unos minutos y vuelve a intentarlo."
                     )
-                    logger.critical(f"Fallo crítico en Swarm: {error_msg}")
+                    logger.critical(f"Cuota agotada tras {MAX_REINTENTOS} intentos")
                     return agent, f"[SISTEMA: {error_msg}]"
+
+            # Error de red o timeout
+            if any(k in error_lower for k in ["timeout", "connection", "network", "unavailable", "503", "502"]):
+                if intento < MAX_REINTENTOS:
+                    espera = 5 * intento
+                    logger.warning(f"Error de red/timeout. Reintentando en {espera}s...")
+                    time.sleep(espera)
+                    continue
+                else:
+                    error_msg = (
+                        "Error de conexión con el servicio de Gemini. "
+                        "Verifica tu conexión a internet y vuelve a intentarlo."
+                    )
+                    logger.critical(f"Error de red persistente tras {MAX_REINTENTOS} intentos")
+                    return agent, f"[SISTEMA: {error_msg}]"
+
+            # Cualquier otro error
+            if intento < MAX_REINTENTOS:
+                time.sleep(3)
+                continue
+            else:
+                # Último intento falló
+                error_msg = (
+                    f"Error inesperado ({error_type}): {error_str[:120]}. "
+                    f"Reintenta en unos minutos o contacta a soporte."
+                )
+                logger.critical(f"Fallo crítico en Swarm: {error_msg}")
+                return agent, f"[SISTEMA: {error_msg}]"
     
     # Fallback final (no debería llegar aquí)
     logger.critical(f"Salida inesperada después de {MAX_REINTENTOS} intentos")
